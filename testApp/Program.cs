@@ -1,15 +1,14 @@
-using System;
 using System.Security.Cryptography;
 using System.Text;
-using System.Threading;
 using AFCP.Core;
 using AFCP.Core.Implementations;
 using AFCP.Core.Transformers;
 using AFCP.Core.Utils;
 
+
+
 internal class Program
 {
-
 
     static byte[] Encrypt(Span<byte> data, byte[] Key, byte[] IV)
     {
@@ -130,4 +129,6 @@ internal class Program
 
         Console.WriteLine("Done!");
     }
+
+
 }
