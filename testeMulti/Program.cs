@@ -1,8 +1,8 @@
-﻿
-
-
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
+using AFCP.Core.Utils;
+
+namespace testeMulti;
 
 public interface IConnection : IDisposable
 {
@@ -23,19 +23,17 @@ public interface IConnection : IDisposable
     public void Close();
 }
 
-
 public interface IMultiStreamServer : IDisposable
 {
     /// <summary>
     /// Handles the creation of new streams
     /// </summary>
     /// <returns></returns>
-
     public void Start();
+
     public IConnection HandleConnections(CancellationToken ct = default);
     public void Stop();
 }
-
 
 public interface IMultiStreamClient : IDisposable
 {
@@ -48,31 +46,43 @@ public interface IMultiStreamClient : IDisposable
 
 public abstract class RequestBasedStreamClient
 {
+    private protected IMultiStreamClient _multiStreamClient;
+
     public RequestBasedStreamClient(IMultiStreamClient client)
     {
-
+        _multiStreamClient = client;
     }
 
-    public abstract TOut SendRequest<TIn, TOut>(TIn data, CancellationToken ct = default);
+    public abstract ReadOnlySpan<byte> SendRequest(ReadOnlySpan<byte> requestData, CancellationToken ct = default);
 }
 
 public abstract class RequestBasedStreamServer
 {
+    public delegate void RequestEvent(object sender, RequestEventArgs e);
+
+    public event RequestEvent? OnRequest;
+    protected IMultiStreamServer _multiStreamServer;
+
     public RequestBasedStreamServer(IMultiStreamServer server)
     {
-
+        _multiStreamServer = server;
     }
 
-    //Conection handler
+    protected virtual void RaiseRequestEvent(RequestEventArgs e)
+    {
+        OnRequest?.Invoke(this, e);
+    }
 }
 
 public class TcpStreamServer : IMultiStreamServer
 {
     private TcpListener _listener;
+
     public TcpStreamServer(int port)
     {
-        _listener = new TcpListener(System.Net.IPAddress.Any, port);
+        _listener = new TcpListener(IPAddress.Any, port);
     }
+
     public void Start()
     {
         _listener.Start();
@@ -81,13 +91,12 @@ public class TcpStreamServer : IMultiStreamServer
 
     public IConnection HandleConnections(CancellationToken ct = default)
     {
-        TcpClient client;
+        var client = _listener.AcceptTcpClient();
+        return new TcpConnection(client);
         using (ct.Register(_listener.Stop))
         {
             try
             {
-                client = _listener.AcceptTcpClient();
-                return new TcpConnection(client);
             }
             catch (SocketException e) when (e.SocketErrorCode == SocketError.Interrupted)
             {
@@ -98,8 +107,6 @@ public class TcpStreamServer : IMultiStreamServer
                 throw new OperationCanceledException(ct);
             }
         }
-
-        throw new NotImplementedException();
     }
 
     public void Stop()
@@ -110,6 +117,28 @@ public class TcpStreamServer : IMultiStreamServer
     public void Dispose()
     {
         _listener.Dispose();
+    }
+}
+
+public class TcpStreamClient : IMultiStreamClient
+{
+    private IPEndPoint _ipEndpoint;
+
+    public TcpStreamClient(IPEndPoint ipEndpoint)
+    {
+        _ipEndpoint = ipEndpoint;
+    }
+
+    public IConnection CreateStream()
+    {
+        var client = new TcpClient();
+        client.Connect(_ipEndpoint);
+
+        return new TcpConnection(client);
+    }
+
+    public void Dispose()
+    {
     }
 }
 
@@ -145,48 +174,124 @@ public class TcpConnection : IConnection
     {
         _stream.Dispose();
         _client.Dispose();
+        _stream = null;
+        _client = null;
     }
-
 }
 
-public class TcpStreamClient : IMultiStreamClient
+public interface ICountableStream
 {
-    private IPEndPoint _ipEndpoint;
-    public TcpStreamClient(IPEndPoint ipEndpoint)
+    public void Write(ReadOnlySpan<byte> data);
+
+    public ReadOnlySpan<byte> Read();
+}
+
+public class DataCompletionStream : ICountableStream
+{
+    private IConnection _connection;
+
+    public DataCompletionStream(IConnection connection)
     {
-        _ipEndpoint = ipEndpoint;
+        _connection = connection;
     }
-    public IConnection CreateStream()
-    {
-        var client = new TcpClient();
-        client.Connect(_ipEndpoint);
 
-        return new TcpConnection(client);
+    private uint ReadDataCount()
+    {
+        Span<byte> bufferLen = stackalloc byte[4];
+        _connection.Read(bufferLen);
+        return Tools.GetUInt(bufferLen);
     }
 
-    public void Dispose()
+    public ReadOnlySpan<byte> Read()
     {
+        var totalBytes = (int)ReadDataCount();
+        Span<byte> actualData = new byte[totalBytes];
 
+        int bytesAlreadyRead = 0;
+        var bytesUnread = totalBytes;
+        while (bytesUnread > 0)
+        {
+            bytesAlreadyRead += _connection.Read(actualData.Slice(bytesAlreadyRead, bytesUnread));
+            bytesUnread = totalBytes - bytesAlreadyRead;
+        }
+
+        return actualData;
+    }
+
+    public void Write(ReadOnlySpan<byte> data)
+    {
+        _connection.Write(Tools.GetBytes((uint)data.Length));
+        _connection.Write(data);
     }
 }
 
+public class RequestEventArgs : EventArgs
+{
+    private DataCompletionStream _stream;
+
+    public RequestEventArgs(DataCompletionStream stream)
+    {
+        _stream = stream;
+    }
+
+    public ReadOnlySpan<byte> ReadRequest()
+    {
+        return _stream.Read();
+    }
+
+    public void Answer(ReadOnlySpan<byte> data)
+    {
+        _stream.Write(data);
+    }
+}
+
+public class RequestStreamServer : RequestBasedStreamServer
+{
+    public RequestStreamServer(IMultiStreamServer server) : base(server)
+    {
+    }
+
+    public void HandleRequests()
+    {
+        var client = _multiStreamServer.HandleConnections();
+        var stream = new DataCompletionStream(client);
+        RaiseRequestEvent(new RequestEventArgs(stream));
+        client.Close();
+        client.Dispose();
+    }
+}
+
+public class RequestStreamClient : RequestBasedStreamClient
+{
+    public RequestStreamClient(IMultiStreamClient client) : base(client)
+    {
+    }
+
+    public override ReadOnlySpan<byte> SendRequest(ReadOnlySpan<byte> requestData, CancellationToken ct = default)
+    {
+        var client = _multiStreamClient.CreateStream();
+
+        var stream = new DataCompletionStream(client);
+        stream.Write(requestData);
+        var data = stream.Read();
 
 
+        client.Close();
+        client.Dispose();
 
-
-
+        return data;
+    }
+}
 
 internal class Program
 {
-    private static void Main(string[] args)
+    public static void Main2()
     {
         using var server = new TcpStreamServer(9999);
         server.Start();
 
         new Thread(() =>
         {
-
-
             using var connection = server.HandleConnections();
 
             var data = new byte[3];
@@ -194,7 +299,6 @@ internal class Program
 
             Console.WriteLine(BitConverter.ToString(data));
             connection.Close();
-
         }).Start();
 
 
@@ -206,5 +310,47 @@ internal class Program
 
 
         server.Stop();
+    }
+
+    private static void Main()
+    {
+        byte[] resp = [4, 5, 6];
+        byte[] req = [1, 2, 3];
+        var ipEndpoint = new IPEndPoint(IPAddress.Loopback, 9999);
+
+        RequestStreamServer requestServer = null!;
+
+        Thread f = null;
+        for (int i = 0; i < 100000; i++)
+        {
+            var server = new TcpStreamServer(9999);
+            server.Start();
+
+            requestServer = new RequestStreamServer(server);
+         
+            requestServer.OnRequest += (_, e) =>
+            {
+                //Console.WriteLine(BitConverter.ToString(requestData.ToArray()));
+                e.Answer(e.ReadRequest());
+            };
+
+            f = new Thread(() =>
+            {
+                requestServer.HandleRequests();
+            });
+            f.Start();
+
+            var client = new TcpStreamClient(ipEndpoint);
+            var requestClient = new RequestStreamClient(client);
+            requestClient.SendRequest(req);
+            //Console.WriteLine(BitConverter.ToString(response.ToArray()));
+
+            client.Dispose();
+
+            server.Stop();
+            server.Dispose();
+        }
+
+        Console.ReadKey();
     }
 }
