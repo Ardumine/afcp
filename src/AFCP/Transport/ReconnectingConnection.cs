@@ -2,25 +2,24 @@ namespace AFCP;
 
 /// <summary>
 /// Wraps a transport factory and auto-reconnects on disconnect with exponential
-/// backoff. This is the "handle disconnects" layer: when the underlying
-/// <see cref="IConnection"/> drops, <see cref="OnDisconnect"/> fires, a reconnect
-/// is attempted (after the backoff delay), and <see cref="OnReconnect"/> fires on
-/// success. In-flight reads/writes during the gap throw; upper layers decide
-/// whether to retry (e.g. <see cref="RequestChannel"/> can resend pending
-/// requests after <see cref="OnReconnect"/>).
+/// backoff. <see cref="OnDisconnect"/> fires when the underlying
+/// <see cref="IConnection"/> drops; a reconnect is attempted on a background
+/// thread, and <see cref="OnReconnect"/> fires on success. Upper layers decide
+/// whether to retry in-flight work.
 ///
-/// The wrapped connection is replaced atomically on reconnect. Reads/writes
-/// block during the reconnect window and resume once a new link is up.
+/// The wrapped connection is replaced atomically under a lock. Reads/writes
+/// see the new connection once the swap completes.
 /// </summary>
 public sealed class ReconnectingConnection : IConnection
 {
     private readonly Func<IConnection> _factory;
     private readonly TimeSpan _initialBackoff;
     private readonly TimeSpan _maxBackoff;
-    private readonly int _maxAttempts; // 0 = infinite
+    private readonly int _maxAttempts;
     private IConnection _current;
     private readonly object _lock = new();
     private int _disposed;
+    private int _reconnecting;
 
     public ReconnectingConnection(Func<IConnection> factory, TimeSpan? initialBackoff = null,
         TimeSpan? maxBackoff = null, int maxAttempts = 0)
@@ -44,25 +43,37 @@ public sealed class ReconnectingConnection : IConnection
     private void OnCurrentDisconnect()
     {
         OnDisconnect?.Invoke();
-        TryReconnect();
+        if (Interlocked.Exchange(ref _reconnecting, 1) == 1) return;
+        new Thread(TryReconnect) { IsBackground = true, Name = "AFCP.ReconnectingConnection" }.Start();
     }
 
     private void TryReconnect()
     {
-        if (_disposed != 0) return;
+        if (_disposed != 0) { _reconnecting = 0; return; }
         var delay = _initialBackoff;
+        var minBackoff = TimeSpan.FromMilliseconds(1);
+        if (delay < minBackoff) delay = minBackoff;
+
         for (var attempt = 1; _maxAttempts == 0 || attempt <= _maxAttempts; attempt++)
         {
             Thread.Sleep(delay);
-            if (_disposed != 0) return;
+            if (_disposed != 0) break;
             try
             {
                 var next = _factory();
+                IConnection? old;
                 lock (_lock)
                 {
+                    old = _current;
                     _current = next;
                     _current.OnDisconnect += OnCurrentDisconnect;
                 }
+                if (old != null)
+                {
+                    old.OnDisconnect -= OnCurrentDisconnect;
+                    try { old.Dispose(); } catch { }
+                }
+                _reconnecting = 0;
                 OnReconnect?.Invoke();
                 return;
             }
@@ -71,6 +82,7 @@ public sealed class ReconnectingConnection : IConnection
                 delay = TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, _maxBackoff.Ticks));
             }
         }
+        _reconnecting = 0;
     }
 
     public int Read(Span<byte> buffer)
@@ -86,7 +98,11 @@ public sealed class ReconnectingConnection : IConnection
     public void Close()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
-        lock (_lock) { _current.Close(); }
+        lock (_lock)
+        {
+            _current.OnDisconnect -= OnCurrentDisconnect;
+            try { _current.Dispose(); } catch { }
+        }
     }
 
     public void Dispose() => Close();
