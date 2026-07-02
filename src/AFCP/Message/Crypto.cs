@@ -16,24 +16,27 @@ namespace AFCP;
 /// sits above. Recommended stack order:
 /// <c>Framing → Checksum → Crypto</c> (checksum the plaintext, then encrypt;
 /// the ciphertext is what crosses the wire).
+///
+/// Read and write are serialized through a lock because <see cref="ICryptoTransform"/>
+/// instances are not thread-safe. Each message uses TransformFinalBlock, which is
+/// safe for CFB mode with PaddingMode.None (it does not finalize state).
 /// </summary>
 public sealed class Crypto : MessageTransformer
 {
     private Aes? _aes;
     private ICryptoTransform? _encryptor;
     private ICryptoTransform? _decryptor;
+    private readonly object _xformLock = new();
 
     public Crypto(IMessageStream baseStream) : base(baseStream) { }
 
     public override IMessageStream Initialize(bool isServer)
     {
-        // Propagate init first (lower layers' handshake), then run ours on top.
         Base.Initialize(isServer);
 
         using var localECDH = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var localPublicKey = localECDH.ExportSubjectPublicKeyInfo();
 
-        // Exchange public keys as framed messages.
         if (isServer)
         {
             var peerKey = Base.Read().ToArray();
@@ -72,7 +75,8 @@ public sealed class Crypto : MessageTransformer
     public override void Write(ReadOnlySpan<byte> message)
     {
         if (_encryptor == null) throw new InvalidOperationException("Crypto not initialized.");
-        var cipher = _encryptor.TransformFinalBlock(message.ToArray(), 0, message.Length);
+        byte[] cipher;
+        lock (_xformLock) { cipher = _encryptor.TransformFinalBlock(message.ToArray(), 0, message.Length); }
         Base.Write(cipher);
     }
 
@@ -81,14 +85,19 @@ public sealed class Crypto : MessageTransformer
         if (_decryptor == null) throw new InvalidOperationException("Crypto not initialized.");
         var cipher = Base.Read();
         if (cipher.Length == 0) return cipher;
-        return _decryptor.TransformFinalBlock(cipher.ToArray(), 0, cipher.Length);
+        byte[] plaintext;
+        lock (_xformLock) { plaintext = _decryptor.TransformFinalBlock(cipher.ToArray(), 0, cipher.Length); }
+        return plaintext;
     }
 
     public override void Dispose()
     {
-        _encryptor?.Dispose();
-        _decryptor?.Dispose();
-        _aes?.Dispose();
+        lock (_xformLock)
+        {
+            _encryptor?.Dispose();
+            _decryptor?.Dispose();
+            _aes?.Dispose();
+        }
         base.Dispose();
     }
 }
