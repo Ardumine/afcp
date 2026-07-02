@@ -5,4 +5,8 @@
   <Folder Name="/test/">
     <Project Path="test/AFCP.Tests/AFCP.Tests.csproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/EchoServer/EchoServer.csproj" />
+    <Project Path="samples/RequestResponse/RequestResponse.csproj" />
+  </Folder>
 </Solution>
