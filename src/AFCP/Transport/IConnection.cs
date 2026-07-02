@@ -3,7 +3,7 @@ namespace AFCP;
 /// <summary>
 /// A duplex byte stream — the transport layer (Layer 0). Implementations:
 /// <see cref="TcpConnection"/> (TCP over any network interface: WiFi, Ethernet),
-/// <see cref="SerialConnection"/> (serial port), <see cref="InMemoryConnectionPair"/>
+/// <see cref="SerialConnection"/> (serial port), <see cref="InMemoryConnection"/>
 /// (in-process test pair), and <see cref="ReconnectingConnection"/> (auto-reconnect
 /// wrapper).
 ///

@@ -140,3 +140,8 @@ samples/
 ```bash
 dotnet test
 ```
+
+## Further reading
+
+- [Architecture overview](docs/architecture.md) — layered design, handshake flow, extensibility
+- [Layer reference](docs/layers.md) — API details and usage for every layer

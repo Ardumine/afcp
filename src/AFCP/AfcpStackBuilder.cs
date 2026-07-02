@@ -64,7 +64,7 @@ public sealed class AfcpStackBuilder
         return msg;
     }
 
-    /// <summary>Compose, handshake, and start a <see cref="RequestChannel"/>. See <see cref="WithRequestChannel"/>.</summary>
+    /// <summary>Compose, handshake, and start a <see cref="RequestChannel"/>.</summary>
     public (IMessageStream stream, RequestChannel channel) BuildWithRequestChannel(bool isServer)
     {
         var stream = Build(isServer);

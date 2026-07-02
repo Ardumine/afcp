@@ -6,7 +6,7 @@ namespace AFCP;
 /// <summary>
 /// Request/response multiplexing over a single <see cref="IMessageStream"/>.
 /// On a serial link there is one channel, so multiple in-flight request/response
-/// pairs must share it; this demuxes them by a 32-bit <see cref="RequestId"/>.
+/// pairs must share it; this demuxes them by a 32-bit RequestId.
 ///
 /// Wire format per message (riding the underlying <c>IMessageStream</c>):
 /// <c>[u8 kind][u32 reqId][u32 payloadLen][payload]</c>.
@@ -15,7 +15,7 @@ namespace AFCP;
 /// The server raises <see cref="OnRequest"/> per incoming request; the handler
 /// calls <see cref="RequestContext.Respond"/>. The client awaits the matching
 /// response via a <see cref="TaskCompletionSource{TResult}"/> keyed by
-/// <see cref="RequestId"/>.
+/// RequestId.
 /// </summary>
 public sealed class RequestChannel : IDisposable
 {
