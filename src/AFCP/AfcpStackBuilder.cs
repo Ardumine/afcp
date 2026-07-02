@@ -29,7 +29,7 @@ public sealed class AfcpStackBuilder
     private bool _camouflage;
     private bool _checksum;
     private bool _crypto;
-    private bool _requestChannel;
+    private string? _loggerName;
 
     public AfcpStackBuilder(IConnection connection) => _conn = connection;
 
@@ -42,8 +42,8 @@ public sealed class AfcpStackBuilder
     /// <summary>Add per-message confidentiality (ECDH + AES-CFB).</summary>
     public AfcpStackBuilder WithCrypto() { _crypto = true; return this; }
 
-    /// <summary>Wrap the result in a <see cref="RequestChannel"/> (req/resp multiplex).</summary>
-    public AfcpStackBuilder WithRequestChannel() { _requestChannel = true; return this; }
+    /// <summary>Insert a <see cref="Logger"/> debug decorator at the byte-stream layer with the given tag.</summary>
+    public AfcpStackBuilder WithLogger(string name) { _loggerName = name; return this; }
 
     /// <summary>Compose the stack and run the handshake. Returns the top layer.</summary>
     public IMessageStream Build(bool isServer)
@@ -51,6 +51,8 @@ public sealed class AfcpStackBuilder
         Streamy streamy = new StreamyFromConnection(_conn);
         if (_camouflage)
             streamy = new Camouflage(streamy);
+        if (_loggerName is not null)
+            streamy = new Logger(streamy, _loggerName);
 
         IMessageStream msg = new Framing(streamy);
         if (_checksum)

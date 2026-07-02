@@ -12,7 +12,7 @@ namespace AFCP;
 /// Optional layer. Composes below <see cref="Framing"/> (camouflage is
 /// byte-level; it must handshake before message framing starts).
 /// </summary>
-public sealed class Camouflage : Streamy
+public sealed class Camouflage : StreamyTransformer
 {
     private static readonly byte[] _serverResponse = """
         HTTP/1.1 200 OK
@@ -31,9 +31,7 @@ public sealed class Camouflage : Streamy
 
         """u8.ToArray();
 
-    private readonly Streamy _base;
-
-    public Camouflage(Streamy baseStream) => _base = baseStream;
+    public Camouflage(Streamy baseStream) : base(baseStream) { }
 
     public override Streamy Initialize(StreamyParameters parameters)
     {
@@ -41,23 +39,20 @@ public sealed class Camouflage : Streamy
         if (parameters.IsServer)
         {
             // Server: read the client's request, send the response.
-            ReadExact(_base, buf, _clientRequest.Length);
-            _base.Write(_serverResponse);
+            ReadExact(Base, buf, _clientRequest.Length);
+            Base.Write(_serverResponse);
         }
         else
         {
             // Client: send request, read response.
-            _base.Write(_clientRequest);
-            ReadExact(_base, buf, _serverResponse.Length);
+            Base.Write(_clientRequest);
+            ReadExact(Base, buf, _serverResponse.Length);
         }
-        _base.Initialize(parameters);
+        Base.Initialize(parameters);
         return this;
     }
 
-    public override int Read(Span<byte> buffer) => _base.Read(buffer);
-    public override void Write(ReadOnlySpan<byte> buffer) => _base.Write(buffer);
-    public override bool IsConnected => _base.IsConnected;
-    public override event Action? OnDisconnect { add => _base.OnDisconnect += value; remove => _base.OnDisconnect -= value; }
+    // Read/Write pass through unchanged — camouflage only injects the HTTP handshake.
 
     private static void ReadExact(Streamy s, Span<byte> buf, int count)
     {

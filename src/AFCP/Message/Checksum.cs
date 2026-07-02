@@ -13,29 +13,22 @@ namespace AFCP;
 /// big-endian u32 lanes with a tail handler) — fast, not cryptographic. For
 /// tamper resistance use <see cref="Crypto"/>; this catches line noise.
 /// </summary>
-public sealed class Checksum : IMessageStream
+public sealed class Checksum : MessageTransformer
 {
-    private readonly IMessageStream _base;
+    public Checksum(IMessageStream baseStream) : base(baseStream) { }
 
-    public Checksum(IMessageStream baseStream) => _base = baseStream;
-
-    public bool IsConnected => _base.IsConnected;
-    public event Action? OnDisconnect { add => _base.OnDisconnect += value; remove => _base.OnDisconnect -= value; }
-
-    public IMessageStream Initialize(bool isServer) => _base.Initialize(isServer);
-
-    public void Write(ReadOnlySpan<byte> message)
+    public override void Write(ReadOnlySpan<byte> message)
     {
         var sum = Compute(message);
         var combined = new byte[message.Length + 4];
         message.CopyTo(combined.AsSpan());
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(message.Length), sum);
-        _base.Write(combined);
+        Base.Write(combined);
     }
 
-    public ReadOnlySpan<byte> Read()
+    public override ReadOnlySpan<byte> Read()
     {
-        var raw = _base.Read();
+        var raw = Base.Read();
         if (raw.Length == 0) return raw;
         if (raw.Length < 4)
             throw new InvalidDataException($"Checksum: frame too short ({raw.Length} bytes).");
@@ -83,6 +76,4 @@ public sealed class Checksum : IMessageStream
             return sum;
         }
     }
-
-    public void Dispose() => _base.Dispose();
 }

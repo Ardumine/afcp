@@ -125,7 +125,7 @@ Console.WriteLine("6. RequestChannel (in-memory, full stack + req/resp multiplex
     {
         try
         {
-            var (_, ch) = new AfcpStackBuilder(b).WithChecksum().WithCrypto().WithRequestChannel().BuildWithRequestChannel(isServer: true);
+            var (_, ch) = new AfcpStackBuilder(b).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: true);
             srvChan = ch;
             ch.OnRequest += ctx => ctx.Respond(Echo(ctx.Payload.ToArray()));
         }
@@ -133,7 +133,7 @@ Console.WriteLine("6. RequestChannel (in-memory, full stack + req/resp multiplex
     }) { IsBackground = true };
     srvThread.Start();
 
-    var (_, cliChan) = new AfcpStackBuilder(a).WithChecksum().WithCrypto().WithRequestChannel().BuildWithRequestChannel(isServer: false);
+    var (_, cliChan) = new AfcpStackBuilder(a).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: false);
 
     var p1 = "req-one"u8.ToArray();
     var p2 = "req-two"u8.ToArray();
@@ -163,7 +163,7 @@ Console.WriteLine("7. TCP loopback (framing + checksum + crypto + RequestChannel
         {
             var tcp = listener.AcceptTcpClient();
             var conn = new TcpConnection(tcp);
-            var (_, ch) = new AfcpStackBuilder(conn).WithChecksum().WithCrypto().WithRequestChannel().BuildWithRequestChannel(isServer: true);
+            var (_, ch) = new AfcpStackBuilder(conn).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: true);
             srvChan = ch;
             ch.OnRequest += ctx => ctx.Respond(Echo(ctx.Payload.ToArray()));
         }
@@ -172,7 +172,7 @@ Console.WriteLine("7. TCP loopback (framing + checksum + crypto + RequestChannel
     serverThread.Start();
 
     var cliConn = new TcpConnection(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, port));
-    var (_, cliChan) = new AfcpStackBuilder(cliConn).WithChecksum().WithCrypto().WithRequestChannel().BuildWithRequestChannel(isServer: false);
+    var (_, cliChan) = new AfcpStackBuilder(cliConn).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: false);
 
     Thread.Sleep(500);
     var payload = "over tcp"u8.ToArray();
@@ -227,9 +227,127 @@ Console.WriteLine("9. Checksum detects corruption");
 }
 
 // ---------------------------------------------------------------------------
+Console.WriteLine("10. Custom StreamyTransformer (XOR, extensibility)");
+{
+    var (a, b) = InMemoryConnection.CreatePair();
+    var payload = "transform me"u8.ToArray();
+    const byte key = 0x5A;
+    var st = new Thread(() =>
+    {
+        try
+        {
+            var srv = new Framing(new XorTransformer(new StreamyFromConnection(b), key));
+            srv.Initialize(isServer: true);
+            var m = srv.Read().ToArray();
+            srv.Write(m);
+            srv.Dispose();
+        }
+        catch (Exception ex) { Fail("10", $"server threw {ex.GetType().Name}: {ex.Message}"); }
+    }) { IsBackground = true };
+    st.Start();
+    var cli = new Framing(new XorTransformer(new StreamyFromConnection(a), key));
+    cli.Initialize(isServer: false);
+    cli.Write(payload);
+    var back = cli.Read().ToArray();
+    st.Join(2000);
+    if (back.SequenceEqual(payload)) Pass("custom XOR transformer echo"); else Fail("custom XOR transformer echo", $"got {BitConverter.ToString(back)}");
+    cli.Dispose();
+}
+
+// ---------------------------------------------------------------------------
+Console.WriteLine("11. StreamyFromStream + StreamFromStreamy adapters");
+{
+    // Wrap a Streamy as a Stream, then back as a Streamy — bytes must pass through
+    // both directions. Built on an in-memory connection pair.
+    var (a, b) = InMemoryConnection.CreatePair();
+    var payload = "via stream adapter"u8.ToArray();
+    var st = new Thread(() =>
+    {
+        try
+        {
+            Streamy baseSrv = new StreamyFromConnection(b);
+            // Streamy -> Stream -> Streamy (round-trip through the adapter pair)
+            baseSrv = new StreamyFromStream(new StreamFromStreamy(baseSrv));
+            var srv = new Framing(baseSrv);
+            srv.Initialize(isServer: true);
+            var m = srv.Read().ToArray();
+            srv.Write(m);
+            srv.Dispose();
+        }
+        catch (Exception ex) { Fail("11", $"server threw {ex.GetType().Name}: {ex.Message}"); }
+    }) { IsBackground = true };
+    st.Start();
+    Streamy baseCli = new StreamyFromConnection(a);
+    baseCli = new StreamyFromStream(new StreamFromStreamy(baseCli));
+    var cli = new Framing(baseCli);
+    cli.Initialize(isServer: false);
+    cli.Write(payload);
+    var back = cli.Read().ToArray();
+    st.Join(2000);
+    if (back.SequenceEqual(payload)) Pass("stream adapter round-trip"); else Fail("stream adapter round-trip", $"got {BitConverter.ToString(back)}");
+    cli.Dispose();
+}
+
+// ---------------------------------------------------------------------------
+Console.WriteLine("12. TcpServer.Accept (server-side listener)");
+{
+    var server = new TcpServer(System.Net.IPAddress.Loopback, 0);
+    server.Start();
+    var port = server.LocalEndpoint.Port;
+
+    RequestChannel? srvChan = null;
+    var serverThread = new Thread(() =>
+    {
+        try
+        {
+            var conn = server.Accept();
+            var (_, ch) = new AfcpStackBuilder(conn).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: true);
+            srvChan = ch;
+            ch.OnRequest += ctx => ctx.Respond(ctx.Payload.ToArray());
+        }
+        catch (Exception ex) { Fail("12", $"server threw {ex.GetType().Name}: {ex.Message}"); }
+    }) { IsBackground = true };
+    serverThread.Start();
+
+    var cliConn = new TcpConnection(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, port));
+    var (_, cliChan) = new AfcpStackBuilder(cliConn).WithChecksum().WithCrypto().BuildWithRequestChannel(isServer: false);
+
+    Thread.Sleep(500);
+    var payload = "via tcp server"u8.ToArray();
+    var resp = cliChan.SendRequest(payload);
+    if (resp.SequenceEqual(payload)) Pass("tcp server accept echo"); else Fail("tcp server accept echo", $"got {BitConverter.ToString(resp)}");
+    cliChan.Dispose();
+    serverThread.Join(2000);
+    srvChan?.Dispose();
+    server.Dispose();
+}
+
+// ---------------------------------------------------------------------------
 Console.WriteLine();
 Console.WriteLine($"passed: {passed}");
 Console.WriteLine($"failed: {failures.Count}");
 foreach (var f in failures) Console.WriteLine(f);
 if (failures.Count > 0) Environment.Exit(1);
 Console.WriteLine("ALL OK");
+
+// ---- A custom StreamyTransformer: XOR every byte with a key (proves the ----
+// ---- extensibility point — users write their own transformers).        ----
+sealed class XorTransformer : StreamyTransformer
+{
+    private readonly byte _key;
+    public XorTransformer(Streamy baseStream, byte key) : base(baseStream) => _key = key;
+
+    public override int Read(Span<byte> buffer)
+    {
+        var n = Base.Read(buffer);
+        for (int i = 0; i < n; i++) buffer[i] ^= _key;
+        return n;
+    }
+
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        var xored = new byte[buffer.Length];
+        for (int i = 0; i < buffer.Length; i++) xored[i] = (byte)(buffer[i] ^ _key);
+        Base.Write(xored);
+    }
+}

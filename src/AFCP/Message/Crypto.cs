@@ -17,22 +17,18 @@ namespace AFCP;
 /// <c>Framing → Checksum → Crypto</c> (checksum the plaintext, then encrypt;
 /// the ciphertext is what crosses the wire).
 /// </summary>
-public sealed class Crypto : IMessageStream
+public sealed class Crypto : MessageTransformer
 {
-    private readonly IMessageStream _base;
     private Aes? _aes;
     private ICryptoTransform? _encryptor;
     private ICryptoTransform? _decryptor;
 
-    public Crypto(IMessageStream baseStream) => _base = baseStream;
+    public Crypto(IMessageStream baseStream) : base(baseStream) { }
 
-    public bool IsConnected => _base.IsConnected;
-    public event Action? OnDisconnect { add => _base.OnDisconnect += value; remove => _base.OnDisconnect -= value; }
-
-    public IMessageStream Initialize(bool isServer)
+    public override IMessageStream Initialize(bool isServer)
     {
         // Propagate init first (lower layers' handshake), then run ours on top.
-        _base.Initialize(isServer);
+        Base.Initialize(isServer);
 
         using var localECDH = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var localPublicKey = localECDH.ExportSubjectPublicKeyInfo();
@@ -40,14 +36,14 @@ public sealed class Crypto : IMessageStream
         // Exchange public keys as framed messages.
         if (isServer)
         {
-            var peerKey = _base.Read().ToArray();
-            _base.Write(localPublicKey);
+            var peerKey = Base.Read().ToArray();
+            Base.Write(localPublicKey);
             EstablishCrypto(localECDH, peerKey);
         }
         else
         {
-            _base.Write(localPublicKey);
-            var peerKey = _base.Read().ToArray();
+            Base.Write(localPublicKey);
+            var peerKey = Base.Read().ToArray();
             EstablishCrypto(localECDH, peerKey);
         }
         return this;
@@ -73,26 +69,26 @@ public sealed class Crypto : IMessageStream
         _decryptor = _aes.CreateDecryptor();
     }
 
-    public void Write(ReadOnlySpan<byte> message)
+    public override void Write(ReadOnlySpan<byte> message)
     {
         if (_encryptor == null) throw new InvalidOperationException("Crypto not initialized.");
         var cipher = _encryptor.TransformFinalBlock(message.ToArray(), 0, message.Length);
-        _base.Write(cipher);
+        Base.Write(cipher);
     }
 
-    public ReadOnlySpan<byte> Read()
+    public override ReadOnlySpan<byte> Read()
     {
         if (_decryptor == null) throw new InvalidOperationException("Crypto not initialized.");
-        var cipher = _base.Read();
+        var cipher = Base.Read();
         if (cipher.Length == 0) return cipher;
         return _decryptor.TransformFinalBlock(cipher.ToArray(), 0, cipher.Length);
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         _encryptor?.Dispose();
         _decryptor?.Dispose();
         _aes?.Dispose();
-        _base.Dispose();
+        base.Dispose();
     }
 }

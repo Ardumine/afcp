@@ -17,15 +17,21 @@ inter-instance communication, but usable standalone for any RPC/streaming app.
 ```
 Layer 0  Transport      IConnection (duplex byte stream)
                           TcpConnection     — TCP (WiFi or Ethernet)
+                          TcpServer         — TCP listener (Accept → IConnection)
                           SerialConnection  — serial port (the single-channel case)
                           InMemoryConnection — in-process test pair
                           ReconnectingConnection — auto-reconnect w/ backoff
+                          TransportRegistry — target-spec factory (tcp://, serial://, inmem://)
 Layer 1  Streamy        span-level byte-stream decorators
-                          StreamyFromConnection (base)
+                          StreamyFromConnection (base, from IConnection)
+                          StreamyFromStream    (base, from any System.IO.Stream)
+                          StreamFromStreamy    (reverse: Streamy → Stream for interop)
+                          StreamyTransformer   (abstract decorator base — write your own)
                           Camouflage — HTTP-header disguise (optional)
                           Logger     — debug (optional)
 Layer 2  IMessageStream message-oriented (length-prefix boundaries)
                           Framing    — [u32 len][payload] over a Streamy
+                          MessageTransformer — abstract decorator base (write your own)
                           Checksum   — per-message additive integrity (decorator)
                           Crypto     — ECDH key exchange + AES-CFB (decorator)
 Layer 3  RequestChannel request/response multiplex over a single channel
@@ -37,6 +43,13 @@ Each layer composes on the one below. `Framing` is the bridge from bytes to
 messages; `Checksum`/`Crypto`/`RequestChannel` stack on an `IMessageStream`. The
 `AfcpStackBuilder` wires the canonical order and runs the role-aware handshake
 (camouflage, ECDH) bottom-up via `IMessageStream.Initialize(isServer)`.
+
+**Extensibility:** the two abstract decorator bases — `StreamyTransformer` (byte
+layer) and `MessageTransformer` (message layer) — hold the wrapped lower stream
+and propagate `Initialize`/`IsConnected`/`OnDisconnect`/`Dispose`. Subclass
+either to add a custom transform (a compressor, a protocol-frame logger, a custom
+cipher, …) and slot it into the stack. The test suite includes an `XorTransformer`
+proving the pattern.
 
 ## Usage
 
@@ -103,12 +116,15 @@ The upstream experiments were "very very simple". This lib adds:
 
 ```
 src/AFCP/
-  Transport/   IConnection, TcpConnection, SerialConnection, InMemoryConnection,
-               ReconnectingConnection, TransportRegistry
-  Streamy/     Streamy (abstract), StreamyFromConnection, Camouflage, Logger
-  Message/     IMessageStream, Framing, Checksum, Crypto, RequestChannel
+  Transport/   IConnection, TcpConnection, TcpServer, SerialConnection,
+               InMemoryConnection, ReconnectingConnection, TransportRegistry
+  Streamy/     Streamy (abstract), StreamyTransformer (abstract decorator base),
+               StreamyFromConnection, StreamyFromStream, StreamFromStreamy,
+               Camouflage, Logger
+  Message/     IMessageStream, MessageTransformer (abstract decorator base),
+               Framing, Checksum, Crypto, RequestChannel
   AfcpStackBuilder.cs
-test/AFCP.Tests/   9 end-to-end tests (in-memory + TCP loopback)
+test/AFCP.Tests/   12 end-to-end tests (in-memory + TCP loopback + custom transformer)
 samples/      the original testApp (Streamy) and testeMulti (request/stream),
               preserved as usage reference
 ```
@@ -120,4 +136,4 @@ dotnet build
 dotnet run --project test/AFCP.Tests
 ```
 
-Expects `passed: 9 / failed: 0 / ALL OK`.
+Expects `passed: 12 / failed: 0 / ALL OK`.
