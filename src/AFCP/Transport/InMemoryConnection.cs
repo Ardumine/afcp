@@ -40,13 +40,14 @@ public sealed class InMemoryConnection : IConnection
 
     public int Read(Span<byte> buffer)
     {
+        if (_disposed != 0) return 0;
         if (_current == null || _currentOffset >= _current.Length)
         {
             try
             {
                 if (!_incoming.TryTake(out _current!, Timeout.Infinite, _cts.Token))
                 {
-                    // Peer completed the queue (close) — this side is effectively disconnected.
+                    _cts.Cancel();
                     RaiseDisconnect();
                     return 0;
                 }
