@@ -14,18 +14,22 @@ namespace AFCP;
 /// </summary>
 public sealed class Framing : IMessageStream
 {
+    public const int DefaultMaxMessageLength = 16 * 1024 * 1024; // 16 MB
+
     private readonly Streamy _base;
     private readonly byte[] _lenBuf = new byte[4];
     private byte[]? _readBuf;
 
     public Framing(Streamy baseStream) => _base = baseStream;
 
+    /// <summary>Maximum allowed message length in bytes. Frames exceeding this limit are rejected.</summary>
+    public int MaxMessageLength { get; set; } = DefaultMaxMessageLength;
+
     public bool IsConnected => _base.IsConnected;
     public event Action? OnDisconnect { add => _base.OnDisconnect += value; remove => _base.OnDisconnect -= value; }
 
     public IMessageStream Initialize(bool isServer)
     {
-        // No handshake of our own; just propagate (camouflage below us may need it).
         _base.Initialize(new StreamyParameters { IsServer = isServer });
         return this;
     }
@@ -45,7 +49,10 @@ public sealed class Framing : IMessageStream
             _readBuf = null;
             return ReadOnlySpan<byte>.Empty;
         }
-        var len = (int)BinaryPrimitives.ReadUInt32LittleEndian(_lenBuf);
+        var len32 = BinaryPrimitives.ReadUInt32LittleEndian(_lenBuf);
+        if (len32 > (uint)MaxMessageLength)
+            throw new InvalidDataException($"Framing: message length {len32} exceeds maximum {MaxMessageLength} bytes.");
+        var len = (int)len32;
         if (len == 0)
         {
             _readBuf = Array.Empty<byte>();
