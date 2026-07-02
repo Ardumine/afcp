@@ -16,6 +16,7 @@ public sealed class TcpConnection : IConnection
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private int _disposed;
+    private int _disconnected;
 
     public TcpConnection(TcpClient client)
     {
@@ -33,7 +34,7 @@ public sealed class TcpConnection : IConnection
         return c;
     }
 
-    public bool IsConnected => _client.Connected && _stream.Socket.Connected;
+    public bool IsConnected => _disposed == 0 && _client.Connected && _stream.Socket.Connected;
 
     public event Action? OnDisconnect;
 
@@ -61,12 +62,13 @@ public sealed class TcpConnection : IConnection
     public void Close()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
-        try { _stream.Close(); _client.Close(); } catch { }
+        try { _stream.Dispose(); _client.Dispose(); } catch { }
         RaiseDisconnect();
     }
 
     private void RaiseDisconnect()
     {
+        if (Interlocked.Exchange(ref _disconnected, 1) == 1) return;
         try { OnDisconnect?.Invoke(); } catch { }
     }
 

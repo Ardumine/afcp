@@ -18,6 +18,7 @@ public sealed class InMemoryConnection : IConnection
     private byte[]? _current;
     private int _currentOffset;
     private int _disposed;
+    private int _disconnected;
 
     internal InMemoryConnection(BlockingCollection<byte[]> incoming, BlockingCollection<byte[]> outgoing)
     {
@@ -72,18 +73,21 @@ public sealed class InMemoryConnection : IConnection
         var copy = data.ToArray();
         try { _outgoing.Add(copy, _cts.Token); }
         catch (OperationCanceledException) { RaiseDisconnect(); throw; }
+        catch (InvalidOperationException) { RaiseDisconnect(); throw; }
     }
 
     public void Close()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _cts.Cancel();
+        _cts.Dispose();
         _outgoing.CompleteAdding();
         RaiseDisconnect();
     }
 
     private void RaiseDisconnect()
     {
+        if (Interlocked.Exchange(ref _disconnected, 1) == 1) return;
         try { OnDisconnect?.Invoke(); } catch { }
     }
 

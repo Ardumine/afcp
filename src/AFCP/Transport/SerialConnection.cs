@@ -15,6 +15,7 @@ public sealed class SerialConnection : IConnection
 {
     private readonly SerialPort _port;
     private int _disposed;
+    private int _disconnected;
 
     public SerialConnection(string portName, int baudRate = 115200)
     {
@@ -30,7 +31,7 @@ public sealed class SerialConnection : IConnection
         _port.Open();
     }
 
-    public bool IsConnected => _port.IsOpen && _disposed == 0;
+    public bool IsConnected => _port.IsOpen && Volatile.Read(ref _disposed) == 0;
 
     public event Action? OnDisconnect;
 
@@ -56,12 +57,13 @@ public sealed class SerialConnection : IConnection
     public void Close()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
-        try { _port.Close(); } catch { }
+        try { _port.Dispose(); } catch { }
         RaiseDisconnect();
     }
 
     private void RaiseDisconnect()
     {
+        if (Interlocked.Exchange(ref _disconnected, 1) == 1) return;
         try { OnDisconnect?.Invoke(); } catch { }
     }
 
