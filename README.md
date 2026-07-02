@@ -1,16 +1,17 @@
 # AFCP
 
-A composable, HCore-free byte-stream protocol stack. Stackable layers — transport,
-framing, integrity, confidentiality, camouflage — ridden by any duplex byte stream
-(TCP over WiFi/Ethernet, serial, in-memory). The remote foundation for HCore
-inter-instance communication, but usable standalone for any RPC/streaming app.
+A composable, library-agnostic byte-stream protocol stack. Stackable layers —
+transport, framing, integrity, confidentiality, camouflage — carried by any
+duplex byte stream (TCP over WiFi/Ethernet, serial, in-memory).
 
-> **Relationship to [KASerializer](https://github.com/Ardumine/kaserializer):** this
-> library is a **pure byte-stream stack** — it does not serialize typed messages and
-> does not reference KASerializer. Serialization of HCore-shaped verbs
-> (`Sync`/`Read`/`Write`/`Subscribe`/`Call`) is the HCore connector module's job
-> (Phase 2 of the HCore AFCP organization). KASerializer is "shared by both" in
-> availability, not in that AFCP itself uses it.
+Built as the remote foundation for HCore inter-instance communication, but
+usable standalone for any RPC/streaming application.
+
+> **Relationship to [KASerializer](https://github.com/Ardumine/kaserializer):**
+> AFCP is a pure byte-stream stack. It does not serialize typed messages and
+> does not reference KASerializer. Serialization of HCore-shaped verbs is the
+> HCore connector module's job. KASerializer is a sibling dependency used
+> elsewhere in the ecosystem, not within AFCP itself.
 
 ## Layered design
 
@@ -30,51 +31,74 @@ Layer 1  Streamy        span-level byte-stream decorators
                           Camouflage — HTTP-header disguise (optional)
                           Logger     — debug (optional)
 Layer 2  IMessageStream message-oriented (length-prefix boundaries)
-                          Framing    — [u32 len][payload] over a Streamy
+                          Framing    — [u32 le length][payload] over a Streamy
                           MessageTransformer — abstract decorator base (write your own)
                           Checksum   — per-message additive integrity (decorator)
                           Crypto     — ECDH key exchange + AES-CFB (decorator)
 Layer 3  RequestChannel request/response multiplex over a single channel
-                          (the testeMulti lineage — for serial: one channel,
-                           many in-flight req/resp pairs demuxed by RequestId)
+                          (for serial: one channel, many in-flight req/resp
+                           pairs demuxed by RequestId)
 ```
 
 Each layer composes on the one below. `Framing` is the bridge from bytes to
-messages; `Checksum`/`Crypto`/`RequestChannel` stack on an `IMessageStream`. The
+messages; `Checksum`/`Crypto`/`RequestChannel` stack on an `IMessageStream`.
 `AfcpStackBuilder` wires the canonical order and runs the role-aware handshake
-(camouflage, ECDH) bottom-up via `IMessageStream.Initialize(isServer)`.
+(camouflage, ECDH) bottom-up.
 
 **Extensibility:** the two abstract decorator bases — `StreamyTransformer` (byte
 layer) and `MessageTransformer` (message layer) — hold the wrapped lower stream
 and propagate `Initialize`/`IsConnected`/`OnDisconnect`/`Dispose`. Subclass
-either to add a custom transform (a compressor, a protocol-frame logger, a custom
-cipher, …) and slot it into the stack. The test suite includes an `XorTransformer`
-proving the pattern.
+either to add a custom transform (e.g. a compressor, a custom cipher) and slot
+it into the stack. The test suite includes both an `XorTransformer` and a
+`ReverseTransformer` proving the pattern.
 
 ## Usage
 
 ```csharp
 using AFCP;
 
-// Client + server over an in-memory pair, full stack.
+// Echo server + client over an in-memory pair, full stack.
+// The server must run on a background thread — Build() with crypto
+// blocks until the ECDH handshake completes with the client.
 var (a, b) = InMemoryConnection.CreatePair();
-var srv = new AfcpStackBuilder(b).WithChecksum().WithCrypto().Build(isServer: true);
-var cli = new AfcpStackBuilder(a).WithChecksum().WithCrypto().Build(isServer: false);
+IMessageStream? srv = null;
+var srvThread = new Thread(() =>
+{
+    srv = new AfcpStackBuilder(b).WithChecksum().WithCrypto().Build(isServer: true);
+    var msg = srv.Read();
+    srv.Write(msg); // echo
+}) { IsBackground = true };
+srvThread.Start();
 
+var cli = new AfcpStackBuilder(a).WithChecksum().WithCrypto().Build(isServer: false);
 cli.Write("hello"u8);
-var msg = srv.Read();        // "hello"
+var echo = cli.Read(); // "hello"
+
+srvThread.Join();
+cli.Dispose(); srv?.Dispose();
 ```
 
 ```csharp
 // Request/response (single channel, multiplexed).
 var (sa, sb) = InMemoryConnection.CreatePair();
-var (_, srvChan) = new AfcpStackBuilder(sb).WithChecksum().WithCrypto()
-    .WithRequestChannel().BuildWithRequestChannel(isServer: true);
-srvChan.OnRequest += ctx => ctx.Respond(ctx.Payload);   // echo
+
+var srvReady = new ManualResetEventSlim();
+RequestChannel? srvChan = null;
+var srvThread = new Thread(() =>
+{
+    var (_, ch) = new AfcpStackBuilder(sb).WithChecksum().WithCrypto()
+        .BuildWithRequestChannel(isServer: true);
+    srvChan = ch;
+    ch.OnRequest += ctx => ctx.Respond(ctx.Payload);
+    srvReady.Set();
+}) { IsBackground = true };
+srvThread.Start();
 
 var (_, cliChan) = new AfcpStackBuilder(sa).WithChecksum().WithCrypto()
-    .WithRequestChannel().BuildWithRequestChannel(isServer: false);
-var resp = cliChan.SendRequest("ping"u8);   // "ping"
+    .BuildWithRequestChannel(isServer: false);
+srvReady.Wait();
+var resp = cliChan.SendRequest("ping"u8); // "ping"
+cliChan.Dispose(); srvChan?.Dispose();
 ```
 
 ```csharp
@@ -83,34 +107,13 @@ var conn = TransportRegistry.Open("tcp://192.168.1.10:8000");
 var conn2 = TransportRegistry.Open("serial:///dev/ttyUSB0?baud=115200");
 ```
 
-## Hardening (over the original `testApp`/`testeMulti`)
-
-The upstream experiments were "very very simple". This lib adds:
-
-- **Disconnect handling.** `IConnection.IsConnected` + `OnDisconnect` event; reads
-  return 0 on EOF, writes throw on a dropped link. `TcpConnection` surfaces socket
-  errors as a disconnect.
-- **Auto-reconnect.** `ReconnectingConnection` wraps a transport factory, retries
-  with exponential backoff (bounded), fires `OnDisconnect`/`OnReconnect`. Upper
-  layers decide whether to retry in-flight work.
-- **Multi-transport selection.** `TransportRegistry` parses a target spec
-  (`tcp://`, `serial://`, `inmem://`); custom schemes via `Register`. WiFi and
-  Ethernet are both TCP — the same `TcpConnection`.
-- **Call timeout.** `RequestChannel.SendRequest` enforces a default 30s timeout
-  (TODO §C7f moved down to the protocol layer) unless the caller cancels sooner.
-- **Single-channel multiplex.** `RequestChannel` demuxes concurrent
-  request/response pairs by `RequestId` — what `testeMulti`'s `RequestBasedStream`
-  was reaching for, but one-shot. This is what makes AFCP work over a serial link
-  (one channel, many in-flight calls).
-
 ## What this is NOT
 
 - **No typed messages.** AFCP carries bytes and messages (length-prefixed). Typed
-  serialization is the caller's concern (KASerializer, JSON, MemoryPack — your
-  choice).
+  serialization is the caller's concern.
 - **No HCore dependency.** Nothing here knows about `/proc`, facets, or modules.
 - **No capability model.** Any peer that connects can exchange messages; access
-  control is the caller's concern (the HCore connector's §C3 gap).
+  control is the caller's responsibility.
 
 ## Layout
 
@@ -118,22 +121,22 @@ The upstream experiments were "very very simple". This lib adds:
 src/AFCP/
   Transport/   IConnection, TcpConnection, TcpServer, SerialConnection,
                InMemoryConnection, ReconnectingConnection, TransportRegistry
-  Streamy/     Streamy (abstract), StreamyTransformer (abstract decorator base),
+  Streamy/     Streamy (abstract), StreamyTransformer (abstract decorator),
                StreamyFromConnection, StreamyFromStream, StreamFromStreamy,
                Camouflage, Logger
-  Message/     IMessageStream, MessageTransformer (abstract decorator base),
+  Message/     IMessageStream, MessageTransformer (abstract decorator),
                Framing, Checksum, Crypto, RequestChannel
   AfcpStackBuilder.cs
-test/AFCP.Tests/   12 end-to-end tests (in-memory + TCP loopback + custom transformer)
-samples/      the original testApp (Streamy) and testeMulti (request/stream),
-              preserved as usage reference
+
+test/AFCP.Tests/       51 xUnit tests
+
+samples/
+  EchoServer/           TCP echo, full stack (checksum + crypto)
+  RequestResponse/      RequestChannel over TCP
 ```
 
 ## Build & test
 
 ```bash
-dotnet build
-dotnet run --project test/AFCP.Tests
+dotnet test
 ```
-
-Expects `passed: 12 / failed: 0 / ALL OK`.
