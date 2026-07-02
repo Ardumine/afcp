@@ -58,6 +58,10 @@ public sealed class Camouflage : StreamyTransformer
     {
         var read = 0;
         while (read < count)
-            read += s.Read(buf.Slice(read, count - read));
+        {
+            var n = s.Read(buf.Slice(read, count - read));
+            if (n <= 0) throw new IOException("Camouflage: peer disconnected during handshake.");
+            read += n;
+        }
     }
 }
