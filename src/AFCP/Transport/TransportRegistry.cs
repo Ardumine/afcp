@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 
 namespace AFCP;
@@ -19,19 +20,24 @@ namespace AFCP;
 /// </summary>
 public static class TransportRegistry
 {
-    private static readonly Dictionary<string, Func<Uri, IConnection>> _schemes = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly ConcurrentDictionary<string, Func<Uri, IConnection>> _schemes = new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly ConcurrentDictionary<string, (InMemoryConnection A, InMemoryConnection B)> _inMem = new();
+
+    static TransportRegistry()
     {
-        ["tcp"] = uri =>
+        _schemes.TryAdd("tcp", uri =>
         {
             var host = uri.Host;
             var port = uri.IsDefaultPort ? 0 : uri.Port;
             if (port == 0) throw new ArgumentException($"tcp:// target '{uri}' needs an explicit port");
-            var endpoint = new IPEndPoint(IPAddress.Parse(host), port);
+            var addresses = Dns.GetHostAddresses(host);
+            if (addresses.Length == 0) throw new ArgumentException($"Cannot resolve hostname '{host}'.");
+            var endpoint = new IPEndPoint(addresses[0], port);
             return new TcpConnection(endpoint);
-        },
-        ["serial"] = uri =>
+        });
+        _schemes.TryAdd("serial", uri =>
         {
-            // serial:///dev/ttyUSB0?baud=115200  — LocalPath is the device path
             var device = uri.LocalPath;
             var baud = 115200;
             var query = uri.Query.TrimStart('?');
@@ -45,10 +51,8 @@ public static class TransportRegistry
                 }
             }
             return new SerialConnection(device, baud);
-        },
-    };
-
-    private static readonly Dictionary<string, (InMemoryConnection A, InMemoryConnection B)> _inMem = new();
+        });
+    }
 
     /// <summary>Open a connection to the given target spec.</summary>
     public static IConnection Open(string target)
@@ -59,22 +63,28 @@ public static class TransportRegistry
         throw new ArgumentException($"Unknown transport scheme '{uri.Scheme}' in '{target}'. Register it via TransportRegistry.Register.");
     }
 
-    /// <summary>Register a custom scheme handler.</summary>
+    /// <summary>Register a custom scheme handler. Thread-safe.</summary>
     public static void Register(string scheme, Func<Uri, IConnection> factory)
-        => _schemes[scheme.ToLowerInvariant()] = factory;
+        => _schemes.AddOrUpdate(scheme.ToLowerInvariant(), factory, (_, _) => factory);
 
-    /// <summary>Register an in-memory pair under a key (for tests). Returns the two endpoints — open one here, the peer opens the other via <c>inmem://key</c>.</summary>
+    /// <summary>
+    /// Register an in-memory pair under a key (for tests). Returns the two endpoints
+    /// — open one here, the peer opens the other via <c>inmem://key</c>.
+    /// Thread-safe; supports multiple keys concurrently.
+    /// </summary>
     public static (IConnection A, IConnection B) RegisterInMemory(string key)
     {
         var (a, b) = InMemoryConnection.CreatePair();
         _inMem[key] = (a, b);
-        // Peer opening "inmem://key" gets the opposite endpoint.
-        Register("inmem", _ =>
+
+        Register("inmem", uri =>
         {
-            if (!_inMem.TryGetValue(key, out var pair))
-                throw new InvalidOperationException($"No in-memory pair registered for key '{key}'.");
-            return pair.B; // caller (peer) gets B
+            var lookupKey = uri.Host;
+            if (!_inMem.TryGetValue(lookupKey, out var pair))
+                throw new InvalidOperationException($"No in-memory pair registered for key '{lookupKey}'.");
+            return pair.B;
         });
+
         return (a, b);
     }
 }
