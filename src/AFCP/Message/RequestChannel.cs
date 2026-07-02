@@ -4,11 +4,9 @@ using System.Collections.Concurrent;
 namespace AFCP;
 
 /// <summary>
-/// Request/response multiplexing over a single <see cref="IMessageStream"/> —
-/// the <c>testeMulti</c> lineage. On a serial link there is one channel, so
-/// multiple in-flight request/response pairs must share it; this demuxes them by
-/// a 32-bit <see cref="RequestId"/>. (Over full-duplex TCP you don't strictly
-/// need it, but it's a clean top semantic either way.)
+/// Request/response multiplexing over a single <see cref="IMessageStream"/>.
+/// On a serial link there is one channel, so multiple in-flight request/response
+/// pairs must share it; this demuxes them by a 32-bit <see cref="RequestId"/>.
 ///
 /// Wire format per message (riding the underlying <c>IMessageStream</c>):
 /// <c>[u8 kind][u32 reqId][u32 payloadLen][payload]</c>.
@@ -17,8 +15,7 @@ namespace AFCP;
 /// The server raises <see cref="OnRequest"/> per incoming request; the handler
 /// calls <see cref="RequestContext.Respond"/>. The client awaits the matching
 /// response via a <see cref="TaskCompletionSource{TResult}"/> keyed by
-/// <see cref="RequestId"/>. A default per-call timeout (TODO §C7f) is enforced
-/// when the caller doesn't supply a <see cref="CancellationToken"/>.
+/// <see cref="RequestId"/>.
 /// </summary>
 public sealed class RequestChannel : IDisposable
 {
@@ -31,14 +28,18 @@ public sealed class RequestChannel : IDisposable
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pending = new();
     private readonly ConcurrentQueue<RequestContext> _buffered = new();
     private readonly object _handlerLock = new();
+    private readonly object _writeLock = new();
     private Action<RequestContext>? _onRequest;
     private uint _nextId;
     private int _disposed;
+    private int _started;
 
-    /// <summary>Fires on each incoming request. The handler MUST call <see cref="RequestContext.Respond"/>.
-    /// Requests that arrive before a handler is subscribed are buffered and drained
-    /// on the first subscribe — so it is safe to call <see cref="Start"/> before
-    /// registering.</summary>
+    /// <summary>
+    /// Fires on each incoming request. The handler MUST call
+    /// <see cref="RequestContext.Respond"/>. Requests that arrive before a
+    /// handler is subscribed are buffered and drained on subscribe — so it
+    /// is safe to call <see cref="Start"/> before registering.
+    /// </summary>
     public event Action<RequestContext> OnRequest
     {
         add
@@ -62,9 +63,10 @@ public sealed class RequestChannel : IDisposable
         _reader = new Thread(ReaderLoop) { IsBackground = true, Name = "AFCP.RequestChannel.Reader" };
     }
 
-    /// <summary>Start the reader loop. Call after <see cref="IMessageStream.Initialize"/>.</summary>
     public RequestChannel Start()
     {
+        if (Interlocked.Exchange(ref _started, 1) == 1)
+            throw new InvalidOperationException("RequestChannel.Start() called more than once.");
         _reader.Start();
         return this;
     }
@@ -72,7 +74,6 @@ public sealed class RequestChannel : IDisposable
     public bool IsConnected => _stream.IsConnected;
     public event Action? OnDisconnect { add => _stream.OnDisconnect += value; remove => _stream.OnDisconnect -= value; }
 
-    /// <summary>Send a request and await the response. Throws on timeout or disconnect.</summary>
     public byte[] SendRequest(ReadOnlySpan<byte> payload, CancellationToken ct = default)
     {
         var id = Interlocked.Increment(ref _nextId);
@@ -81,7 +82,6 @@ public sealed class RequestChannel : IDisposable
 
         WriteFrame(KindRequest, id, payload);
 
-        // Default timeout (§C7f) — 30s unless the caller cancels sooner.
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
         linked.CancelAfter(TimeSpan.FromSeconds(30));
         try
@@ -97,39 +97,42 @@ public sealed class RequestChannel : IDisposable
 
     private void ReaderLoop()
     {
-        var header = new byte[9]; // kind(1) + reqId(4) + payloadLen(4)
         while (!_cts.IsCancellationRequested)
         {
+            ReadOnlySpan<byte> frame;
             try
             {
-                var frame = _stream.Read();
-                if (frame.Length == 0) break; // disconnect
-                if (frame.Length < 9) continue;
-                var kind = frame[0];
-                var reqId = BinaryPrimitives.ReadUInt32LittleEndian(frame.Slice(1, 4));
-                var payload = frame[9..];
-                if (kind == KindRequest)
+                frame = _stream.Read();
+            }
+            catch (IOException) { break; }
+            catch (InvalidDataException) { break; }
+            catch (ObjectDisposedException) { break; }
+
+            if (frame.Length == 0)
+            {
+                if (!_stream.IsConnected) break;
+                continue; // zero-length message, skip
+            }
+            if (frame.Length < 9) continue;
+            var kind = frame[0];
+            var reqId = BinaryPrimitives.ReadUInt32LittleEndian(frame.Slice(1, 4));
+            var payload = frame[9..];
+            if (kind == KindRequest)
+            {
+                var ctx = new RequestContext(reqId, this);
+                ctx.PayloadBytes = payload.ToArray();
+                lock (_handlerLock)
                 {
-                    var ctx = new RequestContext(reqId, this);
-                    ctx.PayloadBytes = payload.ToArray();
-                    lock (_handlerLock)
-                    {
-                        if (_onRequest != null) _onRequest(ctx);
-                        else _buffered.Enqueue(ctx);
-                    }
-                }
-                else if (kind == KindResponse)
-                {
-                    if (_pending.TryRemove(reqId, out var tcs))
-                        tcs.TrySetResult(payload.ToArray());
+                    if (_onRequest != null) _onRequest(ctx);
+                    else _buffered.Enqueue(ctx);
                 }
             }
-            catch
+            else if (kind == KindResponse)
             {
-                break; // stream error → treat as disconnect
+                if (_pending.TryRemove(reqId, out var tcs))
+                    tcs.TrySetResult(payload.ToArray());
             }
         }
-        // Fail all pending requests.
         foreach (var kv in _pending)
             kv.Value.TrySetException(new IOException("RequestChannel: connection closed."));
         _pending.Clear();
@@ -145,7 +148,7 @@ public sealed class RequestChannel : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(1, 4), reqId);
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(5, 4), (uint)payload.Length);
         payload.CopyTo(frame.AsSpan(9));
-        _stream.Write(frame);
+        lock (_writeLock) { _stream.Write(frame); }
     }
 
     public void Dispose()
@@ -164,11 +167,17 @@ public sealed class RequestContext
     private readonly uint _reqId;
     private readonly RequestChannel _channel;
     internal byte[] PayloadBytes = Array.Empty<byte>();
+    private int _responded;
 
     internal RequestContext(uint reqId, RequestChannel channel) { _reqId = reqId; _channel = channel; }
 
     public ReadOnlySpan<byte> Payload => PayloadBytes;
 
     /// <summary>Reply to this request. Call exactly once.</summary>
-    public void Respond(ReadOnlySpan<byte> response) => _channel.SendResponse(_reqId, response);
+    public void Respond(ReadOnlySpan<byte> response)
+    {
+        if (Interlocked.Exchange(ref _responded, 1) == 1)
+            throw new InvalidOperationException("RequestContext.Respond() called more than once for the same request.");
+        _channel.SendResponse(_reqId, response);
+    }
 }
